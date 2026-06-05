@@ -2719,45 +2719,74 @@ class AIAgent:
         return self._rate_limit_state
 
     def _capture_credits(self, http_response: Any) -> None:
-        """Parse x-nous-credits-* headers and cache CreditsState (fail-open)."""
+        """Parse x-nous-credits-* headers, cache CreditsState, fire threshold notices.
+
+        Fail-open throughout — header issues never break the agent loop. The PARSE is
+        swallowed (any error → treated as a miss → keep last-known). The notice
+        EVALUATION/EMIT is a SEPARATE block that WARNS on failure (R1-M2): a bug in the
+        depletion-notice path must not vanish silently under the parse swallow.
+        """
         if http_response is None:
             return
         headers = getattr(http_response, "headers", None)
         if not headers:
             return
         _dev = os.environ.get("HERMES_DEV_CREDITS", "").strip().lower() in ("1", "true", "yes", "on")
+
+        # ── Parse (fail-open → miss; never overwrite good state with None) ──
         try:
             from agent.credits_tracker import parse_credits_headers
             state = parse_credits_headers(headers, provider=self.provider)
-            if state is not None:   # retain-last-known: only overwrite on a fresh valid parse
-                self._credits_state = state
-                # Latch session-start remaining the first time we ever see a header
-                if self._credits_session_start_micros is None:
-                    self._credits_session_start_micros = state.remaining_micros
-                if _dev:
-                    # HERMES_DEV_CREDITS: stream each capture to agent.log — watch live with
-                    # `hermes logs -f` (grep 'credits ▸'). Dev-only; silent for normal users.
-                    spent = self.get_credits_spent_micros()
-                    used = state.used_fraction
-                    logger.info(
-                        "credits ▸ remaining=%d (%s) · paid=%s · denom=%s · used=%s "
-                        "· Δspent=%s · age=%s%s",
-                        state.remaining_micros,
-                        state.remaining_usd or "?",
-                        state.paid_access,
-                        state.denominator_kind,
-                        ("%.0f%%" % (used * 100)) if used is not None else "n/a",
-                        ("%.1f¢" % (spent / 10000)) if spent is not None else "n/a",
-                        ("%.0fs" % state.age_seconds) if state.age_seconds != float("inf") else "n/a",
-                        (" · disabled=%s" % state.disabled_reason) if state.disabled_reason else "",
-                    )
-            elif _dev:
+        except Exception:
+            return  # parse error → treat as a miss, keep last-known
+        if state is None:
+            if _dev:
                 logger.info(
                     "credits ▸ response had no valid x-nous-credits-* headers "
                     "(miss — producer off / non-Nous path / >TTL stale)"
                 )
+            return
+
+        # retain-last-known: only overwrite on a fresh valid parse
+        self._credits_state = state
+        # Latch session-start remaining the first time we ever see a header
+        if self._credits_session_start_micros is None:
+            self._credits_session_start_micros = state.remaining_micros
+        if _dev:
+            # HERMES_DEV_CREDITS: stream each capture to agent.log — watch live with
+            # `hermes logs -f` (grep 'credits ▸'). Dev-only; silent for normal users.
+            spent = self.get_credits_spent_micros()
+            used = state.used_fraction
+            logger.info(
+                "credits ▸ remaining=%d (%s) · paid=%s · denom=%s · used=%s "
+                "· Δspent=%s · age=%s%s",
+                state.remaining_micros,
+                state.remaining_usd or "?",
+                state.paid_access,
+                state.denominator_kind,
+                ("%.0f%%" % (used * 100)) if used is not None else "n/a",
+                ("%.1f¢" % (spent / 10000)) if spent is not None else "n/a",
+                ("%.0fs" % state.age_seconds) if state.age_seconds != float("inf") else "n/a",
+                (" · disabled=%s" % state.disabled_reason) if state.disabled_reason else "",
+            )
+
+        # ── Threshold notices ── only when a consumer is bound (messaging binds none →
+        # state is still cached above for /usage, but no policy runs). Separate try so a
+        # policy/emit bug WARNS rather than being swallowed by the parse path (R1-M2).
+        if getattr(self, "notice_callback", None) is None and getattr(self, "notice_clear_callback", None) is None:
+            return
+        try:
+            from agent.credits_tracker import evaluate_credits_notices
+            latch = getattr(self, "_credits_latch", None)
+            if latch is None:
+                latch = self._credits_latch = {"active": set(), "seen_below_90": False}
+            to_show, to_clear = evaluate_credits_notices(state, latch)
+            for key in to_clear:        # clears FIRST …
+                self._emit_notice_clear(key)
+            for notice in to_show:      # … then shows (depleted lands last in a latest-wins slot)
+                self._emit_notice(notice)
         except Exception:
-            pass  # never break the agent loop
+            logger.warning("credits notice evaluation/emit failed", exc_info=True)
 
     def get_credits_state(self):
         """Return the last captured CreditsState, or None."""
