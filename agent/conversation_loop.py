@@ -310,11 +310,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # Fail-open: any error leaves _credits_state untouched (None) — never blocks startup.
     if getattr(agent, "provider", "") == "nous":
         try:
-            import time as _time
+            import concurrent.futures as _cf
             from hermes_cli.nous_account import get_nous_portal_account_info
             from agent.credits_tracker import CreditsState
 
-            _info = get_nous_portal_account_info(force_fresh=True)
+            # Bounded by a wall-clock timeout so a stalled /api/oauth/account can't
+            # hang session startup (urllib's per-socket timeout isn't wall-clock).
+            with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
+                _info = _pool.submit(get_nous_portal_account_info, force_fresh=True).result(timeout=10.0)
             _acc = _info.paid_service_access_info   # magnitudes (may be None)
             _sub = _info.subscription               # renewal/rollover (may be None)
 
@@ -331,7 +334,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 rollover_micros=_to_micros(getattr(_sub, "rollover_credits", None)),
                 paid_access=_paid if isinstance(_paid, bool) else True,  # fail-open: unknown ⇒ not depleted
                 from_header=False,
-                captured_at=_time.time(),
+                captured_at=time.time(),
             )
             if getattr(agent, "_credits_session_start_micros", None) is None:
                 agent._credits_session_start_micros = agent._credits_state.remaining_micros

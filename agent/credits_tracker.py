@@ -257,7 +257,7 @@ def evaluate_credits_notices(
     if depleted_cond and "credits.depleted" not in active:
         to_show.append(
             AgentNotice(
-                text="✕ Access paused · run /usage to verify top-up / upgrade",
+                text="✕ Credit access paused · run /usage for balance",
                 level="error",
                 kind=CREDITS_NOTICE_KIND,
                 key="credits.depleted",
