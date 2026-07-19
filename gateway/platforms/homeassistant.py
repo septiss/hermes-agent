@@ -55,6 +55,13 @@ class HomeAssistantAdapter(BasePlatformAdapter):
     Subscribes to ``state_changed`` events and forwards them as
     MessageEvent objects.  Supports domain/entity filtering and
     per-entity cooldowns to avoid event floods.
+
+    Events caused by this adapter's own token (i.e. the agent's
+    ``ha_call_service`` calls) are dropped by default so the agent never
+    reacts to its own actions — without this, agent → service call →
+    state_changed → agent forms a feedback loop that toggles devices
+    forever.  Set ``suppress_own_events: false`` in the platform extra
+    config to disable.
     """
 
     MAX_MESSAGE_LENGTH = 4096
@@ -85,6 +92,13 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         self._ignore_entities: Set[str] = set(extra.get("ignore_entities", []))
         self._watch_all: bool = bool(extra.get("watch_all", False))
         self._cooldown_seconds: int = int(extra.get("cooldown_seconds", 30))
+
+        # Feedback-loop guard: drop state_changed events whose context
+        # user_id matches this token's own user — those are changes the
+        # agent itself made via ha_call_service.  Resolved at connect time
+        # via the ``auth/current_user`` WS command.
+        self._suppress_own_events: bool = bool(extra.get("suppress_own_events", True))
+        self._own_user_id: Optional[str] = None
 
         # Cooldown tracking: entity_id -> last_event_timestamp
         self._last_event_time: Dict[str, float] = {}
@@ -167,7 +181,28 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             await self._cleanup_ws()
             return False
 
-        # Step 4: Subscribe to state_changed events
+        # Step 4: Resolve the token's own user id so _handle_ha_event can
+        # drop state changes this agent caused itself.  Must happen before
+        # the event subscription so no event frames interleave with the
+        # command response.
+        self._own_user_id = None
+        if self._suppress_own_events:
+            user_req_id = self._next_id()
+            await self._ws.send_json({
+                "id": user_req_id,
+                "type": "auth/current_user",
+            })
+            msg = await self._ws.receive_json()
+            result = msg.get("result") if msg.get("success") else None
+            self._own_user_id = (result or {}).get("id") or None
+            if not self._own_user_id:
+                logger.warning(
+                    "[%s] Could not resolve own user id (%s) — events caused "
+                    "by this agent's own service calls will NOT be suppressed",
+                    self.name, msg,
+                )
+
+        # Step 5: Subscribe to state_changed events
         sub_id = self._next_id()
         await self._ws.send_json({
             "id": sub_id,
@@ -266,6 +301,21 @@ class HomeAssistantAdapter(BasePlatformAdapter):
 
         if not entity_id:
             return
+
+        # Drop events this agent caused itself: service calls made with our
+        # token carry our user id in the event context.  Forwarding them
+        # would let the agent react to its own actions — a feedback loop
+        # (agent toggles a light → event → agent "corrects" it → event → …)
+        # paced only by the cooldown window.  Checked before the cooldown so
+        # a suppressed self-event never swallows a later human-caused one.
+        if self._own_user_id:
+            context = event.get("context") or {}
+            if context.get("user_id") == self._own_user_id:
+                logger.debug(
+                    "[%s] Suppressing self-caused event for %s",
+                    self.name, entity_id,
+                )
+                return
 
         # Apply ignore filter
         if entity_id in self._ignore_entities:

@@ -257,14 +257,17 @@ def _make_adapter(**extra) -> HomeAssistantAdapter:
     return adapter
 
 
-def _make_event(entity_id, old_state, new_state, old_attrs=None, new_attrs=None):
-    return {
+def _make_event(entity_id, old_state, new_state, old_attrs=None, new_attrs=None, user_id=None):
+    event = {
         "data": {
             "entity_id": entity_id,
             "old_state": {"state": old_state, "attributes": old_attrs or {}},
             "new_state": {"state": new_state, "attributes": new_attrs or {"friendly_name": entity_id}},
         }
     }
+    if user_id is not None:
+        event["context"] = {"id": "ctx123", "parent_id": None, "user_id": user_id}
+    return event
 
 
 class TestEventFilteringPipeline:
@@ -344,6 +347,87 @@ class TestEventFilteringPipeline:
         assert msg_event.source.user_name == "Home Assistant"
         assert msg_event.source.chat_type == "channel"
         assert msg_event.message_id.startswith("ha_light.test_")
+
+
+# ---------------------------------------------------------------------------
+# Self-event suppression (feedback loop guard)
+# ---------------------------------------------------------------------------
+
+
+class TestSelfEventSuppression:
+    """Events caused by the agent's own service calls must not be forwarded.
+
+    Without this guard, agent → ha_call_service → state_changed event →
+    agent forms a feedback loop that toggles devices forever, paced only
+    by the per-entity cooldown.
+    """
+
+    OWN_ID = "hermes-user-id"
+
+    def _adapter(self, **extra):
+        adapter = _make_adapter(watch_all=True, cooldown_seconds=0, **extra)
+        adapter._own_user_id = self.OWN_ID
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_own_event_dropped(self):
+        adapter = self._adapter()
+        await adapter._handle_ha_event(
+            _make_event("light.bedroom_sink", "on", "off", user_id=self.OWN_ID)
+        )
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_other_user_event_forwarded(self):
+        adapter = self._adapter()
+        await adapter._handle_ha_event(
+            _make_event("light.bedroom_sink", "on", "off", user_id="someone-else")
+        )
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_userless_event_forwarded(self):
+        """Physical switches / automations produce events with user_id None."""
+        adapter = self._adapter()
+        await adapter._handle_ha_event(
+            _make_event("light.bedroom_sink", "on", "off", user_id=None)
+        )
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_own_id_forwards_everything(self):
+        """If own user id could not be resolved, nothing is suppressed."""
+        adapter = _make_adapter(watch_all=True, cooldown_seconds=0)
+        assert adapter._own_user_id is None
+        await adapter._handle_ha_event(
+            _make_event("light.bedroom_sink", "on", "off", user_id=self.OWN_ID)
+        )
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_suppressed_event_does_not_consume_cooldown(self):
+        """A dropped self-event must not start the cooldown window — a
+        human-caused change right after it must still be forwarded."""
+        adapter = _make_adapter(watch_all=True, cooldown_seconds=300)
+        adapter._own_user_id = self.OWN_ID
+
+        await adapter._handle_ha_event(
+            _make_event("light.bedroom_sink", "off", "on", user_id=self.OWN_ID)
+        )
+        adapter.handle_message.assert_not_called()
+
+        await adapter._handle_ha_event(
+            _make_event("light.bedroom_sink", "on", "off", user_id=None)
+        )
+        adapter.handle_message.assert_called_once()
+
+    def test_suppression_enabled_by_default(self):
+        adapter = _make_adapter()
+        assert adapter._suppress_own_events is True
+
+    def test_suppression_can_be_disabled(self):
+        adapter = _make_adapter(suppress_own_events=False)
+        assert adapter._suppress_own_events is False
 
 
 # ---------------------------------------------------------------------------

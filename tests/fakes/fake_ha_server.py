@@ -86,6 +86,11 @@ class FakeHAServer:
     def __init__(self, token: str = "test-token-123"):
         self.token = token
 
+        # The user id the fake HA reports for this token via the
+        # ``auth/current_user`` WS command.  Tests use it to build events
+        # that look like the agent's own service calls.
+        self.ha_user_id = "fake-hermes-user-id"
+
         # Observability -- tests inspect these after exercising the adapter.
         self.received_service_calls: List[Dict[str, Any]] = []
         self.received_notifications: List[Dict[str, Any]] = []
@@ -196,38 +201,72 @@ class FakeHAServer:
 
         await ws.send_json({"type": "auth_ok", "ha_version": "2025.1.0"})
 
-        # Step 4: subscribe_events
-        msg = await ws.receive()
-        if msg.type != aiohttp.WSMsgType.TEXT:
-            await ws.close()
-            return ws
-        sub_msg = json.loads(msg.data)
-        sub_id = sub_msg.get("id", 1)
+        # Step 4: handle post-auth commands (auth/current_user,
+        # subscribe_events, ...) in a background reader so the main loop can
+        # push events concurrently once a subscription exists.
+        subscribed = asyncio.Event()
+        sub_id_box: Dict[str, int] = {}
 
-        # Step 5: ACK
-        await ws.send_json({
-            "id": sub_id,
-            "type": "result",
-            "success": True,
-            "result": None,
-        })
+        async def _command_loop() -> None:
+            async for cmd_msg in ws:
+                if cmd_msg.type != aiohttp.WSMsgType.TEXT:
+                    break
+                cmd = json.loads(cmd_msg.data)
+                cmd_id = cmd.get("id", 1)
+                cmd_type = cmd.get("type")
+                if cmd_type == "auth/current_user":
+                    await ws.send_json({
+                        "id": cmd_id,
+                        "type": "result",
+                        "success": True,
+                        "result": {
+                            "id": self.ha_user_id,
+                            "name": "Hermes Agent",
+                            "is_owner": False,
+                        },
+                    })
+                elif cmd_type == "subscribe_events":
+                    sub_id_box["id"] = cmd_id
+                    await ws.send_json({
+                        "id": cmd_id,
+                        "type": "result",
+                        "success": True,
+                        "result": None,
+                    })
+                    subscribed.set()
+                else:
+                    await ws.send_json({
+                        "id": cmd_id,
+                        "type": "result",
+                        "success": True,
+                        "result": None,
+                    })
 
-        # Step 6: push events from queue until closed
+        reader = asyncio.ensure_future(_command_loop())
+
+        # Step 5: push events from queue until closed (once subscribed)
         try:
+            await asyncio.wait_for(subscribed.wait(), timeout=5)
             while not ws.closed:
                 try:
                     event_data = await asyncio.wait_for(
                         self._event_queue.get(), timeout=0.1,
                     )
                     await ws.send_json({
-                        "id": sub_id,
+                        "id": sub_id_box.get("id", 1),
                         "type": "event",
                         "event": event_data,
                     })
                 except asyncio.TimeoutError:
                     continue
-        except (ConnectionResetError, asyncio.CancelledError):
+        except (ConnectionResetError, asyncio.CancelledError, asyncio.TimeoutError):
             pass
+        finally:
+            reader.cancel()
+            try:
+                await reader
+            except (asyncio.CancelledError, Exception):
+                pass
 
         return ws
 
