@@ -71,7 +71,9 @@ class TestGatewayWebSocket:
     async def test_event_received_and_forwarded(self):
         """Server pushes event -> adapter calls handle_message with correct MessageEvent."""
         async with FakeHAServer() as server:
-            adapter = _adapter_for(server)
+            # watch_all is required: the event filter is closed by default,
+            # so an adapter with no watch config drops every event.
+            adapter = _adapter_for(server, watch_all=True)
             adapter.handle_message = AsyncMock()
 
             await adapter.connect()
@@ -125,6 +127,67 @@ class TestGatewayWebSocket:
 
             await asyncio.sleep(0.5)
             assert adapter.handle_message.call_count == 0
+
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_own_user_id_resolved_on_connect(self):
+        """connect() resolves the token's own user id via auth/current_user."""
+        async with FakeHAServer() as server:
+            adapter = _adapter_for(server)
+            connected = await adapter.connect()
+            assert connected is True
+            assert adapter._own_user_id == server.ha_user_id
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_self_caused_event_suppressed(self):
+        """Events carrying the agent's own user_id are dropped; events from
+        other users (or none, e.g. a physical switch) still get through."""
+        async with FakeHAServer() as server:
+            adapter = _adapter_for(server, watch_all=True, cooldown_seconds=0)
+            adapter.handle_message = AsyncMock()
+
+            await adapter.connect()
+
+            # Event caused by the agent's own service call — must be dropped.
+            await server.push_event({
+                "data": {
+                    "entity_id": "light.bedroom",
+                    "old_state": {"state": "off", "attributes": {}},
+                    "new_state": {
+                        "state": "on",
+                        "attributes": {"friendly_name": "Bedroom Light"},
+                    },
+                },
+                "context": {
+                    "id": "ctx1",
+                    "parent_id": None,
+                    "user_id": server.ha_user_id,
+                },
+            })
+
+            # Event caused by a human at the switch — must be forwarded.
+            await server.push_event({
+                "data": {
+                    "entity_id": "light.bedroom",
+                    "old_state": {"state": "on", "attributes": {}},
+                    "new_state": {
+                        "state": "off",
+                        "attributes": {"friendly_name": "Bedroom Light"},
+                    },
+                },
+                "context": {"id": "ctx2", "parent_id": None, "user_id": None},
+            })
+
+            for _ in range(50):
+                if adapter.handle_message.call_count > 0:
+                    break
+                await asyncio.sleep(0.05)
+
+            assert adapter.handle_message.call_count == 1
+            msg_event = adapter.handle_message.call_args[0][0]
+            assert "turned off" in msg_event.text
 
             await adapter.disconnect()
 
